@@ -319,7 +319,7 @@ func decryptAESCBC(encrypted, password []byte, iterations int) ([]byte, error) {
 		return nil, fmt.Errorf("invalid last block padding length: %d", paddingLen)
 	}
 
-	return decrypted[:len(decrypted)-paddingLen], nil
+	return decrypted[32 : len(decrypted)-paddingLen], nil
 }
 
 func decryptAES256GCM(encrypted, password []byte) ([]byte, error) {
