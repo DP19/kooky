@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strconv"
 	"sync"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -15,6 +16,11 @@ import (
 	"github.com/browserutils/kooky"
 	"github.com/browserutils/kooky/internal/timex"
 	"github.com/browserutils/kooky/internal/utils"
+)
+
+const (
+	domainHashChromeDbVersion = 24
+	domainHashPrefixPadding   = 32
 )
 
 // Thanks to https://gist.github.com/dacort/bd6a5116224c594b14db
@@ -27,6 +33,24 @@ func (s *CookieStore) ReadCookies(filters ...kooky.Filter) ([]*kooky.Cookie, err
 		return nil, err
 	} else if s.Database == nil {
 		return nil, errors.New(`database is nil`)
+	}
+
+	err := utils.VisitTableRows(s.Database, "meta", map[string]string{}, func(_ *int64, row utils.TableRow) error {
+		if id, err := row.String("key"); err != nil {
+			return err
+		} else if id != "version" {
+			return nil
+		}
+		if verString, err := row.String("value"); err != nil {
+			return err
+		} else if s.dbVersion, err = strconv.ParseInt(verString, 10, 64); err != nil {
+			return fmt.Errorf("unable to parse chrome db version: %s", err.Error())
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("unable to get chrome db version: %s", err.Error())
 	}
 
 	var cookies []*kooky.Cookie
@@ -175,9 +199,13 @@ func (s *CookieStore) decrypt(encrypted []byte) ([]byte, error) {
 		return nil, fmt.Errorf(`encrypted value is too short (%d<=3)`, len(encrypted))
 	}
 
+	if s.dbVersion == 0 {
+		return nil, fmt.Errorf("unable to get chrome db version")
+	}
+
 	// try to reuse previously successful decryption method
 	if s.DecryptionMethod != nil {
-		decrypted, err := s.DecryptionMethod(encrypted, s.PasswordBytes)
+		decrypted, err := s.DecryptionMethod(encrypted, s.PasswordBytes, s.dbVersion)
 		if err == nil {
 			return decrypted, nil
 		} else {
@@ -185,7 +213,7 @@ func (s *CookieStore) decrypt(encrypted []byte) ([]byte, error) {
 		}
 	}
 
-	var decrypt func(encrypted, password []byte) ([]byte, error)
+	var decrypt func(encrypted, password []byte, dbVersion int64) ([]byte, error)
 
 	// prioritize previously selected platform then current platform and then other platforms in order of usage on non-server computers
 	// TODO: mobile
@@ -211,7 +239,7 @@ func (s *CookieStore) decrypt(encrypted []byte) ([]byte, error) {
 			switch {
 			case bytes.HasPrefix(encrypted, prefixDPAPI[:]):
 				// present before Chrome v80 on Windows
-				decrypt = func(encrypted, _ []byte) ([]byte, error) {
+				decrypt = func(encrypted, _ []byte, dbversion int64) ([]byte, error) {
 					return decryptDPAPI(encrypted)
 				}
 			case bytes.HasPrefix(encrypted, []byte(`v10`)):
@@ -223,8 +251,8 @@ func (s *CookieStore) decrypt(encrypted []byte) ([]byte, error) {
 		case `darwin`:
 			needsKeyringQuerying = true
 			fallbackPassword = fallbackPasswordMacOS[:]
-			decrypt = func(encrypted, password []byte) ([]byte, error) {
-				return decryptAESCBC(encrypted, password, aescbcIterationsMacOS)
+			decrypt = func(encrypted, password []byte, dbVersion int64) ([]byte, error) {
+				return decryptAESCBC(encrypted, password, aescbcIterationsMacOS, dbVersion)
 			}
 		case `linux`:
 			switch {
@@ -236,8 +264,8 @@ func (s *CookieStore) decrypt(encrypted []byte) ([]byte, error) {
 			default:
 				password = fallbackPasswordLinux[:]
 			}
-			decrypt = func(encrypted, password []byte) ([]byte, error) {
-				return decryptAESCBC(encrypted, password, aescbcIterationsLinux)
+			decrypt = func(encrypted, password []byte, dbVersion int64) ([]byte, error) {
+				return decryptAESCBC(encrypted, password, aescbcIterationsLinux, dbVersion)
 			}
 		}
 		if decrypt == nil {
@@ -262,7 +290,7 @@ func (s *CookieStore) decrypt(encrypted []byte) ([]byte, error) {
 			tryNr++
 		}
 
-		decrypted, err := decrypt(encrypted, password)
+		decrypted, err := decrypt(encrypted, password, s.dbVersion)
 		if err == nil {
 			s.DecryptionMethod = decrypt
 			s.OSStr = opsys
@@ -287,7 +315,7 @@ const (
 	aescbcLength          = 16
 )
 
-func decryptAESCBC(encrypted, password []byte, iterations int) ([]byte, error) {
+func decryptAESCBC(encrypted, password []byte, iterations int, dbVersion int64) ([]byte, error) {
 	if len(encrypted) == 0 {
 		return nil, errors.New("empty encrypted value")
 	}
@@ -319,10 +347,10 @@ func decryptAESCBC(encrypted, password []byte, iterations int) ([]byte, error) {
 		return nil, fmt.Errorf("invalid last block padding length: %d", paddingLen)
 	}
 
-	return decrypted[32 : len(decrypted)-paddingLen], nil
+	return stripPrefixPadding(decrypted[:len(decrypted)-paddingLen], dbVersion), nil
 }
 
-func decryptAES256GCM(encrypted, password []byte) ([]byte, error) {
+func decryptAES256GCM(encrypted, password []byte, dbVersion int64) ([]byte, error) {
 	// https://stackoverflow.com/a/60423699
 
 	if len(encrypted) < 3+12+16 {
@@ -354,5 +382,13 @@ func decryptAES256GCM(encrypted, password []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	return plaintext, nil
+	return stripPrefixPadding(plaintext, dbVersion), nil
+}
+
+func stripPrefixPadding(decrypted []byte, dbVersion int64) []byte {
+	defaultPrefixPadding := 0
+	if dbVersion >= domainHashChromeDbVersion {
+		defaultPrefixPadding = domainHashPrefixPadding
+	}
+	return decrypted[defaultPrefixPadding:]
 }
